@@ -1,96 +1,143 @@
-# -*- coding: utf-8 -*-
-import time,threading,socket,Queue,optparse,sys,struct
-from urlparse import urlparse
-
-parser = optparse.OptionParser(usage="%prog --ara=\"arama\" --url=\"http://www.google.com/?asdasd=asd\" --ip-list=\"iplist.txt\"\n\nOrnek:	%prog --ara=\"netiyi\" --url=\"http://www.sabotaj.net/\" --ip-list=\"iplist.txt\"")
-parser.add_option('-t', '--thread', dest="THREAD_COUNT",type="int",
-				  action="store",help="Thread sayisi. Varsayilan: 1024", default=1024)
-parser.add_option('-a', '--ara', dest="ARANACAK_STR",type="str",
-				  action="store",help="Websitesinde gecen bir cumle veya kelime.")
-parser.add_option('-u', '--url', dest="WEB_URL",type="str",
-				  action="store",help="Cumle veya kelimenin gectigi sayfa urlsi.")
-parser.add_option('-i', '--ip-list', dest="IPLIST_FILE",type="str",
-				  action="store",help="Suphelendiginiz iplerin listesi. CIDR veya IP listesi.")
-
-(options, args) = parser.parse_args()
-
-if len(sys.argv) < 4:
-	parser.print_help()
-	sys.exit(1)
-
-def parse_line(line):
-	if "/" in line:
-		data=line.strip().split("/")
-		start=struct.unpack("!L", socket.inet_aton(data[0]))[0]
-		return [socket.inet_ntoa(struct.pack('!L', start+x)) for x in xrange(0,2**(32-int(data[1])))]
-	else:
-		return [line.strip()]
-
-print "{0} Thread.".format(options.THREAD_COUNT)
-if not options.WEB_URL:
-	parser.error('Url girmelisiniz.')
-parsed=urlparse(options.WEB_URL)
-if parsed.scheme=="https":
-	parser.error('Simdilik ssl desteklemiyoruz.')
-elif parsed.scheme!="http":
-	parser.error('Dogru url girdiginize emin olun.')
-
-if not options.ARANACAK_STR:
-	parser.error('Aranacak kelime girmelisiniz.')
+from urllib.parse import urlparse
+import time
+import threading
+import socket
+import queue
+import optparse
+import struct
+import ssl
 
 
-if parsed.query != "":
-	url = "{0}?{1}".format(parsed.path, parsed.query)
-else:
-	url = parsed.path
-IP_LIST_FILE= open(options.IPLIST_FILE,"r").readlines()
-HEADERS= "GET {0} HTTP/1.1\r\nHost: {1}\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n".format(url,parsed.netloc)
-q=Queue.Queue()
-for line in IP_LIST_FILE:
-	IP_LIST = parse_line(line)
-	for ip in IP_LIST:
-		q.put(str(ip))
-IP_LIST_FILE=None
-QUEUE_LEN=q.qsize()
+class iprangescanner():
+    def __init__(self, url, inputfile, threadcount, searchstr):
 
-print "{0} ip taranacak.".format(QUEUE_LEN)
+        self.url = url
+        self.inputfile = inputfile
+        self.threadcount = threadcount
+        self.searchstr = searchstr
 
+        self.isssl, self.port, self.url, self.host = self.parse_url()
+        self.headers = self.create_headers()
 
+        self.q = queue.Queue()
 
-def socket_oku(sock):
-	doc=""
-	buf = sock.recv(1024)
-	while buf:
-		doc+=buf
-		buf = sock.recv(1024)
-	return doc
+        self.main()
 
-def worker():
-	while not q.empty():
-		s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-		ip=q.get()
-		try:
-			s.connect((ip, 80))
-			s.settimeout(5.0)
-			s.send(HEADERS)
-			html=socket_oku(s)
-			if options.ARANACAK_STR in html:
-				print ip
-				open("bulundu.txt","a").write("{0}\n".format(ip))
-		except:
-			None
-		s.close()
+    def ip2long(self, ip):
+        return struct.unpack("!L", socket.inet_aton(ip))[0]
 
-for i in xrange(0,options.THREAD_COUNT):
-	try:
-		threading.Thread( target=worker, args=() ).start()
-	except:
-		print "{0}. thread acilamadi."
-while True:
-	new_size=q.qsize()
-	if not new_size==0:
-		print "{1}/{0}".format(QUEUE_LEN, QUEUE_LEN - new_size)
-		time.sleep(1)
-	else:
-		break
+    def long2ip(self, long):
+        return socket.inet_ntoa(struct.pack('!L', long))
 
+    def parse_line(self, line):
+        if "/" in line:
+            data = line.strip().split("/")
+            start = self.ip2long(data[0])
+            return [self.long2ip(start + x) for x in
+                range(0, 2**(32 - int(data[1])))]
+        elif "-" in line:
+            data = list(map(self.ip2long, line.strip().split("-")))
+            return [self.long2ip(x) for x in
+                range(min(data), max(data))]
+        else:
+            return [line.strip()]
+
+    def decode(self, s):
+        encodings = ('ascii', 'utf8', 'latin1')
+        for encoding in encodings:
+            try:
+                return s.decode(encoding)
+            except UnicodeDecodeError:
+                pass
+        return s.decode('ascii', 'ignore')
+
+    def parse_url(self):
+        parsed = urlparse(self.url)
+        print(parsed)
+
+        if parsed.scheme == "https":
+            isssl = True
+            port = 443
+        else:
+            isssl = False
+            port = 80
+
+        if parsed.query == "":
+            url = parsed.path
+        else:
+            url = "{0}?{1}".format(parsed.path, parsed.query)
+
+        return isssl, port, url, parsed.netloc
+
+    def create_headers(self):
+        headers = "GET {0} HTTP/1.0\r\n".format(self.url) + \
+                  "Host: {0}\r\n".format(self.host) + \
+                  "Connection: close\r\n" + \
+                  "Accept-Encoding: None\r\n" + \
+                  "User-Agent: Mozilla/5.0\r\n\r\n"
+        return headers.encode("ascii")
+
+    def read_socket(self, sock):
+        doc = bytearray()
+        buf = sock.recv(1024)
+        while buf:
+            doc += buf
+            buf = sock.recv(1024)
+        return self.decode(doc)
+
+    def worker(self):
+        while not self.q.empty():
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ip = self.q.get()
+            try:
+                s.settimeout(5.0)
+                s.connect((ip, self.port))
+                if self.isssl:
+                    s = ssl.wrap_socket(s)
+                s.send(self.headers)
+                html = self.read_socket(s)
+                if self.searchstr in html and "cf-ray:" not in html:
+                    open("output.txt", "a").write("{0}\n".format(ip))
+
+            except:
+                pass
+            s.close()
+
+    def main(self):
+        with open(self.inputfile, "r") as file:
+            lines = file.readlines()
+            for line in lines:
+                iplist = self.parse_line(line)
+                for ip in iplist:
+                    #print(ip)
+                    self.q.put(str(ip))
+
+        self.queue_len = self.q.qsize()
+        print("QUEUE LEN: {0}".format(self.queue_len))
+
+        for i in range(0, self.threadcount):
+            threading.Thread(target=self.worker, args=()).start()
+
+if __name__ == "__main__":
+
+    parser = optparse.OptionParser(usage="%prog --find=\"search\" --url=\"http://www.google.com/?asdasd=asd\" --ip-list=\"iplist.txt\"")
+
+    parser.add_option('-t', '--thread', dest="THREAD_COUNT", type="int",
+                      action="store", help="Thread count. (1024)", default=1024)
+
+    parser.add_option('-f', '--find', dest="SEARCH_STR", type="str",
+                      action="store", help="Search for a string in website.")
+
+    parser.add_option('-u', '--url', dest="WEB_URL", type="str",
+                      action="store", help="Url of website")
+
+    parser.add_option('-i', '--ip-list', dest="IPLIST_FILE", type="str",
+                      action="store", help="Suspected ip list. CIDR, IP-range and IP list are all valid.", default="iplist.txt")
+
+    (options, args) = parser.parse_args()
+
+    scanner = iprangescanner(options.WEB_URL, options.IPLIST_FILE, options.THREAD_COUNT, options.SEARCH_STR)
+
+    while not scanner.q.empty():
+        print(scanner.q.qsize())
+        time.sleep(1)
